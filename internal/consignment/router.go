@@ -13,6 +13,7 @@ import (
 
 	"github.com/OpenNSW/core/httputil"
 	"github.com/OpenNSW/core/pagination"
+	"github.com/OpenNSW/core/taskflow/store"
 	workflow "github.com/OpenNSW/core/workflow"
 	nswaudit "github.com/OpenNSW/nsw-srilanka/internal/audit"
 	"github.com/OpenNSW/nsw-srilanka/internal/authn"
@@ -735,8 +736,12 @@ func (c *Router) auditTaskWorkflowEvent(ctx context.Context, e nswaudit.Event) {
 	}
 	caseID := ""
 	if c.cs.taskStore != nil {
-		if record, ok := c.cs.taskStore.GetTaskByWorkflowID(ctx, e.TargetID); ok {
+		record, err := c.cs.taskStore.GetTaskByWorkflowID(ctx, e.TargetID)
+		switch {
+		case err == nil:
 			caseID = record.CaseID
+		case !errors.Is(err, store.ErrTaskNotFound):
+			slog.WarnContext(ctx, "consignment: case unavailable for task workflow audit", "workflowId", e.TargetID, "error", err)
 		}
 	}
 	c.auditFlowEventWithCaseID(ctx, e, caseID)

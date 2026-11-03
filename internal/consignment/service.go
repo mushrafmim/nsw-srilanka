@@ -32,8 +32,9 @@ type TaskStore interface {
 	// GetTasks lists the tasks filter matches. The consignment detail and the engine status
 	// pass only a CaseID, so every task of the case is listed whatever its read roles: the
 	// detail authorizes its caller on the consignment, and the engine status is an admin view.
-	GetTasks(ctx context.Context, filter store.TaskFilter) []store.TaskRecord
-	GetTaskByWorkflowID(ctx context.Context, workflowID string) (store.TaskRecord, bool)
+	// A non-nil error means the tasks could not be read, not that there are none.
+	GetTasks(ctx context.Context, filter store.TaskFilter) ([]store.TaskRecord, error)
+	GetTaskByWorkflowID(ctx context.Context, workflowID string) (store.TaskRecord, error)
 }
 
 // CaseFlows creates a case and starts and lists its flows. *caseflow.Service satisfies it.
@@ -601,7 +602,10 @@ func (s *Service) buildNodeDTOsFromTaskRecords(ctx context.Context, consignmentI
 	if s.taskStore == nil {
 		return nil, fmt.Errorf("task store not initialized")
 	}
-	tasks := s.taskStore.GetTasks(ctx, store.TaskFilter{CaseID: consignmentID})
+	tasks, err := s.taskStore.GetTasks(ctx, store.TaskFilter{CaseID: consignmentID})
+	if err != nil {
+		return nil, fmt.Errorf("list tasks of consignment %s: %w", consignmentID, err)
+	}
 
 	dtos := make([]WorkflowNodeResponseDTO, 0, len(tasks))
 	for _, t := range tasks {
