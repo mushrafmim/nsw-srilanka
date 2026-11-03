@@ -5,12 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 type invoiceCompleter struct {
@@ -25,25 +21,17 @@ func (c *invoiceCompleter) CompleteTaskStep(_ context.Context, taskID, stepID st
 	return nil
 }
 
-func newInvoiceEvents(t *testing.T) (*InvoiceEvents, sqlmock.Sqlmock, *invoiceCompleter) {
-	t.Helper()
-
-	conn, mock, err := sqlmock.New()
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close() })
-
-	db, err := gorm.Open(postgres.New(postgres.Config{Conn: conn}), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	require.NoError(t, err)
-
+func newInvoiceEvents(flow *fakeFlow) (*InvoiceEvents, *invoiceCompleter) {
 	tasks := &invoiceCompleter{}
-	return NewInvoiceEvents(db, tasks), mock, tasks
+	return NewInvoiceEvents(flow, flow, tasks), tasks
 }
 
-func expectParkedInvoice(mock sqlmock.Sqlmock, taskID string) {
-	mock.ExpectQuery(`SELECT .*FROM "taskflow_tasks"`).
-		WillReturnRows(sqlmock.NewRows([]string{"task_id", "active_step_id"}).AddRow(taskID, "step-"+taskID))
+// invoiceParkedOn returns the flow with its approval settled and its payment wait
+// taskID parked on the order.
+func invoiceParkedOn(taskID string) *fakeFlow {
+	return newFlow().
+		wait(ApprovalWaitTemplateID, "approval", "COMPLETED", 1).
+		wait(PaymentWaitTemplateID, taskID, stateQueuedExternally, 2)
 }
 
 // event decodes a CMS payload, so the fixtures read as what they send.
@@ -96,7 +84,7 @@ const paid = `{
 func TestInvoiceEvents_RefusesAnythingButThePayment(t *testing.T) {
 	for _, event := range []string{"invoice.generated", "invoice.cancelled"} {
 		t.Run(event, func(t *testing.T) {
-			service, _, tasks := newInvoiceEvents(t)
+			service, tasks := newInvoiceEvents(invoiceParkedOn("task-1"))
 
 			err := service.Handle(context.Background(), invoiceEvent(t, `{"event":"`+event+`","slug":"8d326f3a-643a-4a1d-8072-87130288b032"}`))
 
@@ -108,11 +96,9 @@ func TestInvoiceEvents_RefusesAnythingButThePayment(t *testing.T) {
 
 // The payment is what ends the step, and the receipt is what the trader keeps.
 func TestInvoiceEvents_PaidReleasesTheStep(t *testing.T) {
-	service, mock, tasks := newInvoiceEvents(t)
-	expectParkedInvoice(mock, "slpa_4_0_invoice:abc")
+	service, tasks := newInvoiceEvents(invoiceParkedOn("slpa_4_0_invoice:abc"))
 
 	require.NoError(t, service.Handle(context.Background(), invoiceEvent(t, paid)))
-	require.NoError(t, mock.ExpectationsWereMet())
 
 	require.True(t, tasks.called)
 	assert.Equal(t, "slpa_4_0_invoice:abc", tasks.taskID)
@@ -150,11 +136,9 @@ func TestInvoiceEvents_PaidReleasesTheStep(t *testing.T) {
 // it is 16 beside a paid_amount of 4776, so reading it -- even as a last
 // resort -- would put "LKR 16.00" under a receipt for 4,776. It is not read.
 func TestInvoiceEvents_NeverReportsTheDollarFigureAsPaid(t *testing.T) {
-	service, mock, tasks := newInvoiceEvents(t)
-	expectParkedInvoice(mock, "slpa_4_0_invoice:abc")
+	service, tasks := newInvoiceEvents(invoiceParkedOn("slpa_4_0_invoice:abc"))
 
 	require.NoError(t, service.Handle(context.Background(), invoiceEvent(t, paid)))
-	require.NoError(t, mock.ExpectationsWereMet())
 
 	assert.Equal(t, 4776.0, tasks.payload["payable_lkr"])
 	for key, value := range tasks.payload {
@@ -163,18 +147,16 @@ func TestInvoiceEvents_NeverReportsTheDollarFigureAsPaid(t *testing.T) {
 }
 
 func TestInvoiceEvents_MatchesOnTheOrderNumberWhenThereIsNoSlug(t *testing.T) {
-	service, mock, tasks := newInvoiceEvents(t)
-	expectParkedInvoice(mock, "task-1")
+	service, tasks := newInvoiceEvents(invoiceParkedOn("task-1"))
 
 	e := invoiceEvent(t, paid)
 	e.Slug = ""
 	require.NoError(t, service.Handle(context.Background(), e))
-	require.NoError(t, mock.ExpectationsWereMet())
 	assert.True(t, tasks.called)
 }
 
 func TestInvoiceEvents_RefusesWhatItCannotActOn(t *testing.T) {
-	service, _, _ := newInvoiceEvents(t)
+	service, _ := newInvoiceEvents(newFlow())
 
 	t.Run("an event from neither lifecycle", func(t *testing.T) {
 		e := invoiceEvent(t, `{"event":"invoice.cancelled","slug":"s"}`)
@@ -193,35 +175,24 @@ func TestInvoiceEvents_RefusesWhatItCannotActOn(t *testing.T) {
 // CMS retrying; an invoice for an order raised elsewhere is reported as missing.
 func TestInvoiceEvents_RedeliveryAndUnknownOrder(t *testing.T) {
 	t.Run("redelivery", func(t *testing.T) {
-		service, mock, tasks := newInvoiceEvents(t)
-		mock.ExpectQuery(`SELECT .*FROM "taskflow_tasks"`).WillReturnError(gorm.ErrRecordNotFound)
-		mock.ExpectQuery(`SELECT "state" FROM "taskflow_tasks"`).WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("COMPLETED"))
+		service, tasks := newInvoiceEvents(newFlow().wait(PaymentWaitTemplateID, "invoice", "COMPLETED", 2))
 
 		require.NoError(t, service.Handle(context.Background(), invoiceEvent(t, paid)))
 		assert.False(t, tasks.called)
 	})
 
 	t.Run("an order this deployment never raised", func(t *testing.T) {
-		service, mock, _ := newInvoiceEvents(t)
-		mock.ExpectQuery(`SELECT .*FROM "taskflow_tasks"`).WillReturnError(gorm.ErrRecordNotFound)
-		mock.ExpectQuery(`SELECT "state" FROM "taskflow_tasks"`).WillReturnRows(sqlmock.NewRows([]string{"state"}))
-		mock.ExpectQuery(`SELECT count\(\*\) FROM "taskflow_tasks"`).
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+		service, _ := newInvoiceEvents(&fakeFlow{})
 
 		assert.ErrorIs(t, service.Handle(context.Background(), invoiceEvent(t, paid)), ErrOrderNotFound)
 	})
 
-	// The approval task carries the same slug, so an invoice event redelivered
-	// after the flow finished must be judged by the invoice wait alone.
-	t.Run("a redelivery once the invoice wait has finished", func(t *testing.T) {
-		service, mock, tasks := newInvoiceEvents(t)
-		mock.ExpectQuery(`SELECT .*FROM "taskflow_tasks"`).WillReturnError(gorm.ErrRecordNotFound)
-		mock.ExpectQuery(`SELECT "state" FROM "taskflow_tasks"`).
-			WithArgs(slug, slug, PaymentWaitTemplateID).
-			WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("COMPLETED"))
+	// The approval wait finished too, so an invoice event must be judged by the
+	// invoice wait alone: one that has not opened yet is retried, not dropped.
+	t.Run("before the invoice wait opens", func(t *testing.T) {
+		service, tasks := newInvoiceEvents(newFlow().wait(ApprovalWaitTemplateID, "approval", "COMPLETED", 1))
 
-		require.NoError(t, service.Handle(context.Background(), invoiceEvent(t, paid)))
-		require.NoError(t, mock.ExpectationsWereMet())
+		assert.ErrorIs(t, service.Handle(context.Background(), invoiceEvent(t, paid)), ErrNotWaitingYet)
 		assert.False(t, tasks.called)
 	})
 }

@@ -1,6 +1,7 @@
 package serviceorder
 
 import (
+	"context"
 	"log/slog"
 
 	"github.com/OpenNSW/core/remote"
@@ -16,10 +17,23 @@ import (
 // and identifies the submitting company with the slpacmsuser-key header, which
 // the workflow carries and BuildHeaders presents. See the ecdn package for the
 // same arrangement on the declaration itself.
-type Interpreter struct{}
+//
+// The CMS answers an order it raised later, by webhook, so each raised order is
+// recorded in orders (see RecordDispatch) for the webhook to find its flow by.
+type Interpreter struct {
+	orders *Orders
+}
 
-// NewInterpreter returns the service-order interpreter.
-func NewInterpreter() *Interpreter { return &Interpreter{} }
+// NewInterpreter returns the service-order interpreter, recording the orders it
+// raises in orders.
+func NewInterpreter(orders *Orders) *Interpreter { return &Interpreter{orders: orders} }
+
+// RecordDispatch records the order the CMS raised with the task that raised it,
+// the consignment's case and the flow's workflow. The api_call plugin calls it
+// once Interpret has accepted the call.
+func (i *Interpreter) RecordDispatch(ctx context.Context, taskID, caseID, workflowID string, captured map[string]any) error {
+	return recordOrder(ctx, i.orders, taskID, caseID, workflowID, captured)
+}
 
 // BuildRequest assembles the order from the mapped form.
 //

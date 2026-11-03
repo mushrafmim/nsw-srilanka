@@ -38,7 +38,7 @@ func fclForm() map[string]any {
 // transport asks for.
 func built(t *testing.T, form map[string]any) Request {
 	t.Helper()
-	body, ok := NewInterpreter().BuildRequest(map[string]any{"payload": form}).(remote.JSONBody)
+	body, ok := NewInterpreter(nil).BuildRequest(map[string]any{"payload": form}).(remote.JSONBody)
 	require.True(t, ok, "the order is sent as JSON")
 	req, ok := body.V.(Request)
 	require.True(t, ok, "the body carries the order")
@@ -131,12 +131,12 @@ func TestBuildRequest_SendsNothingItCannotAssemble(t *testing.T) {
 // the cms package's — this only pins that the order presents the key.
 func TestInterpreter_BuildHeaders(t *testing.T) {
 	assert.Equal(t, map[string]string{cms.ClientKeyHeader: "agztNvLSUA"},
-		NewInterpreter().BuildHeaders(map[string]any{cms.ClientKeyInput: "agztNvLSUA"}))
-	assert.Nil(t, NewInterpreter().BuildHeaders(map[string]any{}))
+		NewInterpreter(nil).BuildHeaders(map[string]any{cms.ClientKeyInput: "agztNvLSUA"}))
+	assert.Nil(t, NewInterpreter(nil).BuildHeaders(map[string]any{}))
 }
 
 func TestInterpret(t *testing.T) {
-	i := NewInterpreter()
+	i := NewInterpreter(nil)
 
 	// The response the CMS actually gives: the order's own workflow state, not a
 	// verdict, and no invoice yet. The order number is what says it exists.

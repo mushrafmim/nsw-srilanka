@@ -104,8 +104,11 @@ type SundryInterpreter struct {
 	Interpreter
 }
 
-// NewSundryInterpreter returns the sundry-order interpreter.
-func NewSundryInterpreter() *SundryInterpreter { return &SundryInterpreter{} }
+// NewSundryInterpreter returns the sundry-order interpreter, recording the
+// orders it raises in orders as Interpreter does.
+func NewSundryInterpreter(orders *Orders) *SundryInterpreter {
+	return &SundryInterpreter{Interpreter{orders: orders}}
+}
 
 // BuildRequest assembles the sundry order from the mapped form.
 //

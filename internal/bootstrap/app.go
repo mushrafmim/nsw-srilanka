@@ -39,6 +39,7 @@ import (
 	"github.com/OpenNSW/nsw-srilanka/external-integration/customs/asycuda/cusdec"
 	"github.com/OpenNSW/nsw-srilanka/external-integration/customs/asycuda/parkedtask"
 	"github.com/OpenNSW/nsw-srilanka/external-integration/payment/govpay"
+	"github.com/OpenNSW/nsw-srilanka/external-integration/slpa/serviceorder"
 	slpawebhook "github.com/OpenNSW/nsw-srilanka/external-integration/slpa/webhook"
 	nswaudit "github.com/OpenNSW/nsw-srilanka/internal/audit"
 	nswauthn "github.com/OpenNSW/nsw-srilanka/internal/authn"
@@ -447,7 +448,9 @@ func Build(ctx context.Context, cfg *config.Config) (app *App, err error) { //no
 		slceHandler = asycuda.NewHandler(cusdecWebhookService, cdnWebhookService).
 			WithAuditor(auditor, cusdecRepo, cdnRepo)
 
-		// SLPA webhook stack. SLPA signs its calls with a shared secret rather than
+		// SLPA webhook stack. The service-order plugins record each order the CMS
+		// raises (see initTask), and the webhook finds the flow waiting on it by that
+		// record. SLPA signs its calls with a shared secret rather than
 		// presenting an IdP token, so this handler owns its own authentication and
 		// the route below carries no bearer middleware.
 		// Refused at boot rather than started without the route. SLPA reports every
@@ -457,9 +460,10 @@ func Build(ctx context.Context, cfg *config.Config) (app *App, err error) { //no
 		// happened. The outbound half of this integration fails the same way when
 		// its own secret is missing (see the services registry), and a missing
 		// secret is a deployment fault worth stopping for either way.
+		slpaOrders := serviceorder.NewOrders(db)
 		slpaHandler, err = slpawebhook.NewHandler(
-			slpawebhook.NewOrderEvents(db, systemTasks),
-			slpawebhook.NewInvoiceEvents(db, systemTasks),
+			slpawebhook.NewOrderEvents(slpaOrders, tm, systemTasks),
+			slpawebhook.NewInvoiceEvents(slpaOrders, tm, systemTasks),
 			cfg.Integrations.SLPAWebhook(),
 		)
 		if err != nil {
@@ -1028,7 +1032,7 @@ func initTask(
 		DispatchNotes: dispatchNotes,
 		Cases:         declarations,
 		Notes:         dispatchNotes,
-	}); err != nil {
+	}, serviceorder.NewOrders(db)); err != nil {
 		return nil, nil, fmt.Errorf("failed to register task plugins: %w", err)
 	}
 	taskStore := gormstore.New(db)

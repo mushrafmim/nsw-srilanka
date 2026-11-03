@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-
-	"gorm.io/gorm"
 )
 
 // EventInvoicePaid is the one invoice event this side acts on. What SLPA bills
@@ -90,10 +88,10 @@ type InvoiceEvents struct {
 	tasks  TaskCompleter
 }
 
-// NewInvoiceEvents binds the service to the task store it reads and the task
-// manager it writes through.
-func NewInvoiceEvents(db *gorm.DB, tasks TaskCompleter) *InvoiceEvents {
-	return &InvoiceEvents{lookup: taskLookup{db: db}, tasks: tasks}
+// NewInvoiceEvents binds the service to the orders recorded when the CMS raised
+// them, the tasks it reads, and the task manager it writes through.
+func NewInvoiceEvents(orders OrderFinder, lister TaskLister, tasks TaskCompleter) *InvoiceEvents {
+	return &InvoiceEvents{lookup: taskLookup{orders: orders, tasks: lister}, tasks: tasks}
 }
 
 // Handle closes the waiting step once the invoice has been paid.
@@ -110,8 +108,7 @@ func (s *InvoiceEvents) Handle(ctx context.Context, event InvoiceEvent) error {
 	}
 
 	correlator := event.correlator()
-	taskID, stepID, err := s.lookup.parked(ctx, PaymentWaitTemplateID,
-		"data->'so'->>'slug' = ? OR data->'so'->>'service_order_no' = ?", correlator, correlator)
+	taskID, stepID, err := s.lookup.parked(ctx, PaymentWaitTemplateID, correlator)
 	if err != nil {
 		return err
 	}

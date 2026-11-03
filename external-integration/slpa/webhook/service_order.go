@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-
-	"gorm.io/gorm"
 )
 
 // The events SLPA's CMS sends as a service order moves through its approvals.
@@ -106,10 +104,10 @@ type OrderEvents struct {
 	tasks  TaskCompleter
 }
 
-// NewOrderEvents binds the service to the task store it reads and the task
-// manager it writes through.
-func NewOrderEvents(db *gorm.DB, tasks TaskCompleter) *OrderEvents {
-	return &OrderEvents{lookup: taskLookup{db: db}, tasks: tasks}
+// NewOrderEvents binds the service to the orders recorded when the CMS raised
+// them, the tasks it reads, and the task manager it writes through.
+func NewOrderEvents(orders OrderFinder, lister TaskLister, tasks TaskCompleter) *OrderEvents {
+	return &OrderEvents{lookup: taskLookup{orders: orders, tasks: lister}, tasks: tasks}
 }
 
 // Handle applies what the CMS decided.
@@ -125,7 +123,7 @@ func (s *OrderEvents) Handle(ctx context.Context, event OrderEvent) error {
 		return err
 	}
 
-	taskID, stepID, err := s.lookup.parked(ctx, ApprovalWaitTemplateID, "data->'so'->>'slug' = ?", event.Slug)
+	taskID, stepID, err := s.lookup.parked(ctx, ApprovalWaitTemplateID, strings.TrimSpace(event.Slug))
 	if err != nil {
 		return err
 	}

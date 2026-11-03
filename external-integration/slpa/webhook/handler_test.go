@@ -6,44 +6,24 @@ import (
 	"strings"
 	"testing"
 
-	sqlmock "github.com/DATA-DOG/go-sqlmock"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// handlerOver builds the handler over a store that answers every lookup the way
-// the test wants, since one signed route carries both lifecycles.
+// handlerOver builds the handler over a flow whose approval and payment waits are
+// both parked on the order, or, unless parked, over a case that never raised it,
+// since one signed route carries both lifecycles.
 func handlerOver(t *testing.T, parked bool) (*Handler, *orderCompleter) {
 	t.Helper()
 
-	conn, mock, err := sqlmock.New()
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close() })
-
-	db, err := gorm.Open(postgres.New(postgres.Config{Conn: conn}), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	require.NoError(t, err)
-
-	mock.MatchExpectationsInOrder(false)
-	for i := 0; i < 4; i++ {
-		if parked {
-			mock.ExpectQuery(`SELECT "task_id","active_step_id" FROM "taskflow_tasks"`).
-				WillReturnRows(sqlmock.NewRows([]string{"task_id", "active_step_id"}).AddRow("task-1", "step-1"))
-			continue
-		}
-		mock.ExpectQuery(`SELECT "task_id","active_step_id" FROM "taskflow_tasks"`).WillReturnError(gorm.ErrRecordNotFound)
-		mock.ExpectQuery(`SELECT "state" FROM "taskflow_tasks"`).WillReturnRows(sqlmock.NewRows([]string{"state"}))
-		mock.ExpectQuery(`SELECT count\(\*\) FROM "taskflow_tasks"`).
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	flow := &fakeFlow{}
+	if parked {
+		flow = newFlow().
+			wait(ApprovalWaitTemplateID, "task-1", stateQueuedExternally, 1).
+			wait(PaymentWaitTemplateID, "task-2", stateQueuedExternally, 2)
 	}
-
 	tasks := &orderCompleter{}
-	h, err := NewHandler(NewOrderEvents(db, tasks), NewInvoiceEvents(db, tasks), Config{Secret: secret})
+	h, err := NewHandler(NewOrderEvents(flow, flow, tasks), NewInvoiceEvents(flow, flow, tasks), Config{Secret: secret})
 	require.NoError(t, err)
 	return h, tasks
 }

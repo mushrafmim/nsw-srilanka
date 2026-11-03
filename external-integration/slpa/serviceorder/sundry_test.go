@@ -34,7 +34,7 @@ func builtSundry(t *testing.T, form map[string]any) SundryRequest {
 	if form != nil {
 		inputs["payload"] = form
 	}
-	body, ok := NewSundryInterpreter().BuildRequest(inputs).(remote.JSONBody)
+	body, ok := NewSundryInterpreter(nil).BuildRequest(inputs).(remote.JSONBody)
 	require.True(t, ok, "the order is sent as JSON")
 	req, ok := body.V.(SundryRequest)
 	require.True(t, ok, "the body carries the sundry order")
@@ -123,12 +123,12 @@ func TestBuildSundry_MessagesNameTheLine(t *testing.T) {
 // SLPA identifies the submitting company by the same header on a sundry order.
 func TestSundryInterpreter_BuildHeaders(t *testing.T) {
 	assert.Equal(t, map[string]string{cms.ClientKeyHeader: "agztNvLSUA"},
-		NewSundryInterpreter().BuildHeaders(map[string]any{cms.ClientKeyInput: "agztNvLSUA"}))
-	assert.Nil(t, NewSundryInterpreter().BuildHeaders(map[string]any{}))
+		NewSundryInterpreter(nil).BuildHeaders(map[string]any{cms.ClientKeyInput: "agztNvLSUA"}))
+	assert.Nil(t, NewSundryInterpreter(nil).BuildHeaders(map[string]any{}))
 }
 
 func TestSundryInterpret(t *testing.T) {
-	i := NewSundryInterpreter()
+	i := NewSundryInterpreter(nil)
 
 	t.Run("raised", func(t *testing.T) {
 		ok, out := i.Interpret(nil, map[string]any{"data": map[string]any{

@@ -154,7 +154,10 @@ type CustomsSubmissions struct {
 // payments.PaymentService. NOTIFICATION uses NotificationPlugin which
 // dispatches SMS/email through notifications.Manager. ogaFiles issues the file
 // tokens EXTERNAL_REVIEW sends OGAs.
-func Register(reg *flowplugins.Registry, mgr *remote.Manager, paymentService payment.Service, files FileFetcher, ogaFiles OGAFiles, customs CustomsSubmissions) error {
+//
+// slpaOrders records the service orders the SLPA order plugins raise, for the SLPA
+// webhook to find the flow waiting on each.
+func Register(reg *flowplugins.Registry, mgr *remote.Manager, paymentService payment.Service, files FileFetcher, ogaFiles OGAFiles, customs CustomsSubmissions, slpaOrders *serviceorder.Orders) error {
 	if reg == nil {
 		return fmt.Errorf("plugins: registry is nil")
 	}
@@ -188,8 +191,8 @@ func Register(reg *flowplugins.Registry, mgr *remote.Manager, paymentService pay
 		{TaskTypeCustomsCaseDeclaration, NewCaseDeclarationPlugin(customs.Cases)},
 		{TaskTypeCustomsCDNCancel, NewCDNCancelPlugin(customs.Notes)},
 		{TaskTypeSLPAECDNUpload, NewAPICallPluginWithInterpreter(mgr, ecdn.NewInterpreter())},
-		{TaskTypeSLPAServiceOrder, NewAPICallPluginWithInterpreter(mgr, serviceorder.NewInterpreter())},
-		{TaskTypeSLPASundryOrder, NewAPICallPluginWithInterpreter(mgr, serviceorder.NewSundryInterpreter())},
+		{TaskTypeSLPAServiceOrder, NewAPICallPluginWithInterpreter(mgr, serviceorder.NewInterpreter(slpaOrders))},
+		{TaskTypeSLPASundryOrder, NewAPICallPluginWithInterpreter(mgr, serviceorder.NewSundryInterpreter(slpaOrders))},
 		{TaskTypeSLPASundryServices, NewAPICallPluginWithInterpreter(mgr, serviceorder.NewServicesInterpreter())},
 		{TaskTypeSLPAInvoiceGenerate, NewAPICallPluginWithInterpreter(mgr, invoice.NewGenerateInterpreter())},
 		{TaskTypeSLPAConsolidationFetch, NewAPICallPluginWithInterpreter(mgr, consolidation.NewFetchInterpreter())},

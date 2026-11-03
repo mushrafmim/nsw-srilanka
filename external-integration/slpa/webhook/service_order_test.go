@@ -2,17 +2,12 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"testing"
 
-	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
-
-const slug = "8d326f3a-643a-4a1d-8072-87130288b032"
 
 // completer records what the service asked the task manager to do.
 type orderCompleter struct {
@@ -27,27 +22,14 @@ func (c *orderCompleter) CompleteTaskStep(_ context.Context, taskID, stepID stri
 	return nil
 }
 
-func newOrderEvents(t *testing.T) (*OrderEvents, sqlmock.Sqlmock, *orderCompleter) {
-	t.Helper()
-
-	conn, mock, err := sqlmock.New()
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close() })
-
-	db, err := gorm.Open(postgres.New(postgres.Config{Conn: conn}), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	require.NoError(t, err)
-
+func newOrderEvents(flow *fakeFlow) (*OrderEvents, *orderCompleter) {
 	tasks := &orderCompleter{}
-	return NewOrderEvents(db, tasks), mock, tasks
+	return NewOrderEvents(flow, flow, tasks), tasks
 }
 
-// expectParked answers the lookup for the task waiting on this order.
-func expectParked(mock sqlmock.Sqlmock, taskID string) {
-	mock.ExpectQuery(`SELECT .*FROM "taskflow_tasks"`).
-		WithArgs(slug, ApprovalWaitTemplateID, stateQueuedExternally, 1).
-		WillReturnRows(sqlmock.NewRows([]string{"task_id", "active_step_id"}).AddRow(taskID, "step-"+taskID))
+// parkedOn returns the flow with its approval wait taskID parked on the order.
+func parkedOn(taskID string) *fakeFlow {
+	return newFlow().wait(ApprovalWaitTemplateID, taskID, stateQueuedExternally, 1)
 }
 
 func orderEvent(name string) OrderEvent {
@@ -66,11 +48,12 @@ func orderEvent(name string) OrderEvent {
 // The accountant's approval is the end of SLPA's review, so the step waiting on
 // it is released and the flow moves on.
 func TestOrderEvents_ApprovalReleasesTheStep(t *testing.T) {
-	service, mock, tasks := newOrderEvents(t)
-	expectParked(mock, "slpa_3_0_decision:abc")
+	flow := parkedOn("slpa_3_0_decision:abc")
+	service, tasks := newOrderEvents(flow)
 
 	require.NoError(t, service.Handle(context.Background(), orderEvent(EventApprovedByAccountant)))
-	require.NoError(t, mock.ExpectationsWereMet())
+	assert.Equal(t, "consignment-1", flow.filters[0].CaseID, "the wait is looked for in the order's case")
+	assert.Equal(t, "flow-1", flow.filters[0].ParentWorkflowID, "and in the flow that raised it")
 
 	require.True(t, tasks.called)
 	assert.Equal(t, "slpa_3_0_decision:abc", tasks.taskID)
@@ -88,11 +71,9 @@ func TestOrderEvents_ApprovalReleasesTheStep(t *testing.T) {
 func TestOrderEvents_RejectionReleasesTheStep(t *testing.T) {
 	for _, name := range []string{EventRejectedByAccountsClerk, EventRejectedByAccountant} {
 		t.Run(name, func(t *testing.T) {
-			service, mock, tasks := newOrderEvents(t)
-			expectParked(mock, "task-1")
+			service, tasks := newOrderEvents(parkedOn("task-1"))
 
 			require.NoError(t, service.Handle(context.Background(), orderEvent(name)))
-			require.NoError(t, mock.ExpectationsWereMet())
 			assert.Equal(t, DecisionRejected, tasks.payload["decision"])
 		})
 	}
@@ -109,11 +90,9 @@ func TestOrderEvents_ProgressGoesThroughTheTaskManagerToo(t *testing.T) {
 		EventRejectedToAccountsClerk: "Returned by the accountant to the accounts clerk",
 	} {
 		t.Run(name, func(t *testing.T) {
-			service, mock, tasks := newOrderEvents(t)
-			expectParked(mock, "task-1")
+			service, tasks := newOrderEvents(parkedOn("task-1"))
 
 			require.NoError(t, service.Handle(context.Background(), orderEvent(name)))
-			require.NoError(t, mock.ExpectationsWereMet())
 
 			require.True(t, tasks.called)
 			assert.Equal(t, false, tasks.payload["final"], "the order is still with SLPA")
@@ -126,66 +105,40 @@ func TestOrderEvents_ProgressGoesThroughTheTaskManagerToo(t *testing.T) {
 // A redelivery of a decision already applied finds nothing parked. The CMS is
 // answered rather than told to retry, which is what stops the retries.
 func TestOrderEvents_RedeliveryIsAnswered(t *testing.T) {
-	service, mock, tasks := newOrderEvents(t)
-
-	mock.ExpectQuery(`SELECT .*FROM "taskflow_tasks"`).
-		WillReturnError(gorm.ErrRecordNotFound)
-	mock.ExpectQuery(`SELECT "state" FROM "taskflow_tasks"`).
-		WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("COMPLETED"))
+	service, tasks := newOrderEvents(newFlow().wait(ApprovalWaitTemplateID, "task-1", "COMPLETED", 1))
 
 	require.NoError(t, service.Handle(context.Background(), orderEvent(EventApprovedByAccountant)))
-	require.NoError(t, mock.ExpectationsWereMet())
 	assert.False(t, tasks.called)
 }
 
 // An order this deployment never raised is a different matter: the CMS is told
 // so, and may retry in case the two are racing.
 func TestOrderEvents_UnknownOrder(t *testing.T) {
-	service, mock, _ := newOrderEvents(t)
-
-	mock.ExpectQuery(`SELECT .*FROM "taskflow_tasks"`).
-		WillReturnError(gorm.ErrRecordNotFound)
-	mock.ExpectQuery(`SELECT "state" FROM "taskflow_tasks"`).
-		WillReturnRows(sqlmock.NewRows([]string{"state"}))
-	mock.ExpectQuery(`SELECT count\(\*\) FROM "taskflow_tasks"`).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	service, tasks := newOrderEvents(&fakeFlow{})
 
 	assert.ErrorIs(t, service.Handle(context.Background(), orderEvent(EventApprovedByAccountant)), ErrOrderNotFound)
+	assert.False(t, tasks.called)
 }
 
 // The decision arrives before the task that waits for it — the consignment holds
 // the order, but this wait has not opened yet. Their retry resolves it.
 func TestOrderEvents_BeforeTheWaitOpens(t *testing.T) {
-	service, mock, tasks := newOrderEvents(t)
-
-	mock.ExpectQuery(`SELECT .*FROM "taskflow_tasks"`).
-		WillReturnError(gorm.ErrRecordNotFound)
-	mock.ExpectQuery(`SELECT "state" FROM "taskflow_tasks"`).
-		WillReturnRows(sqlmock.NewRows([]string{"state"}))
-	mock.ExpectQuery(`SELECT count\(\*\) FROM "taskflow_tasks"`).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	service, tasks := newOrderEvents(newFlow())
 
 	assert.ErrorIs(t, service.Handle(context.Background(), orderEvent(EventApprovedByAccountant)), ErrNotWaitingYet)
 	assert.False(t, tasks.called)
 }
 
 // A redelivered final approval must be answered even while the invoice task that
-// followed it is open. Both tasks carry the same slug, so judging the redelivery
-// by every row would let that sibling say "retry" for a decision already applied
-// — and SLPA would keep retrying it for as long as the invoice went unpaid.
+// followed it is open: judging the redelivery by every task of the flow would let
+// that sibling say "retry" for a decision already applied — and SLPA would keep
+// retrying it for as long as the invoice went unpaid.
 func TestOrderEvents_RedeliveryIsAnsweredWhileTheInvoiceTaskRuns(t *testing.T) {
-	service, mock, tasks := newOrderEvents(t)
-
-	mock.ExpectQuery(`SELECT .*FROM "taskflow_tasks"`).
-		WillReturnError(gorm.ErrRecordNotFound)
-	// Scoped to the approval wait: the invoice task's QUEUED_EXTERNALLY row
-	// carries the same slug and must not be consulted here.
-	mock.ExpectQuery(`SELECT "state" FROM "taskflow_tasks"`).
-		WithArgs(slug, ApprovalWaitTemplateID).
-		WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("COMPLETED"))
+	service, tasks := newOrderEvents(newFlow().
+		wait(ApprovalWaitTemplateID, "approval", "COMPLETED", 1).
+		wait(PaymentWaitTemplateID, "invoice", stateQueuedExternally, 2))
 
 	require.NoError(t, service.Handle(context.Background(), orderEvent(EventApprovedByAccountant)))
-	require.NoError(t, mock.ExpectationsWereMet())
 	assert.False(t, tasks.called)
 }
 
@@ -193,19 +146,78 @@ func TestOrderEvents_RedeliveryIsAnsweredWhileTheInvoiceTaskRuns(t *testing.T) {
 // still being applied. Answering "already applied" would drop an event nothing
 // acted on, so the CMS is asked to retry.
 func TestOrderEvents_BetweenStepsAsksForARetry(t *testing.T) {
-	service, mock, tasks := newOrderEvents(t)
-
-	mock.ExpectQuery(`SELECT .*FROM "taskflow_tasks"`).
-		WillReturnError(gorm.ErrRecordNotFound)
-	mock.ExpectQuery(`SELECT "state" FROM "taskflow_tasks"`).
-		WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("STARTING"))
+	service, tasks := newOrderEvents(newFlow().wait(ApprovalWaitTemplateID, "task-1", "STARTING_STEP", 1))
 
 	assert.ErrorIs(t, service.Handle(context.Background(), orderEvent(EventApprovedByAccountant)), ErrNotWaitingYet)
 	assert.False(t, tasks.called)
 }
 
+// SLPA rejected the flow's first order and the trader raised another. The first
+// order's approval wait finished, but it does not answer for the new order: a
+// decision on the new order before its wait opens is retried, not dropped.
+func TestOrderEvents_AnEarlierOrdersWaitDoesNotAnswerForANewOrder(t *testing.T) {
+	flow := &fakeFlow{}
+	flow.raise("first-order", "SO-1", workflowID, "slpa_2_0_service_order:1", 0)
+	flow.wait(ApprovalWaitTemplateID, "slpa_3_0_approval:1", "COMPLETED", 1)
+	flow.raise(slug, serviceOrderNo, workflowID, "slpa_2_0_service_order:2", 10)
+	service, tasks := newOrderEvents(flow)
+
+	assert.ErrorIs(t, service.Handle(context.Background(), orderEvent(EventApprovedByAccountant)), ErrNotWaitingYet)
+	assert.False(t, tasks.called)
+
+	flow.wait(ApprovalWaitTemplateID, "slpa_3_0_approval:2", stateQueuedExternally, 11)
+	require.NoError(t, service.Handle(context.Background(), orderEvent(EventApprovedByAccountant)))
+	assert.Equal(t, "slpa_3_0_approval:2", tasks.taskID)
+}
+
+// A late event about an order the flow has since replaced is answered, so the
+// CMS stops retrying it, and never reaches the new order's wait.
+func TestOrderEvents_AReplacedOrderIsAnswered(t *testing.T) {
+	flow := &fakeFlow{}
+	flow.raise(slug, serviceOrderNo, workflowID, "slpa_2_0_service_order:1", 0)
+	flow.wait(ApprovalWaitTemplateID, "slpa_3_0_approval:1", "COMPLETED", 1)
+	flow.raise("second-order", "SO-2", workflowID, "slpa_2_0_service_order:2", 10)
+	flow.wait(ApprovalWaitTemplateID, "slpa_3_0_approval:2", stateQueuedExternally, 11)
+	service, tasks := newOrderEvents(flow)
+
+	require.NoError(t, service.Handle(context.Background(), orderEvent(EventRejectedByAccountant)))
+	assert.False(t, tasks.called)
+}
+
+// Each flow on the consignment waits on its own order: a sundry order's wait is
+// not the one a decision on the main order releases.
+func TestOrderEvents_AnotherFlowsWaitIsNotReleased(t *testing.T) {
+	service, tasks := newOrderEvents(newFlow().
+		waitIn("sundry-flow", ApprovalWaitTemplateID, "sundry-approval", stateQueuedExternally, 1))
+
+	assert.ErrorIs(t, service.Handle(context.Background(), orderEvent(EventApprovedByAccountant)), ErrNotWaitingYet)
+	assert.False(t, tasks.called)
+}
+
+// Tasks that could not be read are not "nothing is waiting": the CMS is answered
+// with a server error, and its retry lands once they can be.
+func TestOrderEvents_FailedReadIsNotAnAnswer(t *testing.T) {
+	flow := parkedOn("task-1")
+	flow.listErr = errors.New("db down")
+	service, tasks := newOrderEvents(flow)
+
+	err := service.Handle(context.Background(), orderEvent(EventApprovedByAccountant))
+	require.ErrorContains(t, err, "db down")
+	assert.NotErrorIs(t, err, ErrNotWaitingYet)
+	assert.NotErrorIs(t, err, ErrOrderNotFound)
+	assert.False(t, tasks.called)
+}
+
+// Two tasks of one flow parked on the same order is a fault, not a choice to make.
+func TestOrderEvents_RefusesToPickAmongTwoParkedWaits(t *testing.T) {
+	service, tasks := newOrderEvents(parkedOn("task-1").wait(ApprovalWaitTemplateID, "task-2", stateQueuedExternally, 2))
+
+	require.Error(t, service.Handle(context.Background(), orderEvent(EventApprovedByAccountant)))
+	assert.False(t, tasks.called)
+}
+
 func TestOrderEvents_RefusesWhatItCannotActOn(t *testing.T) {
-	service, _, _ := newOrderEvents(t)
+	service, _ := newOrderEvents(newFlow())
 
 	t.Run("an event that is not modelled", func(t *testing.T) {
 		e := orderEvent("service_order.something_else")
